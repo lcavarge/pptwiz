@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+aiofiles
+PyPDF2
+python-docx
+
+# Áudio (opcional)
+git+https://github.com/openai/whisper.git
+ffmpeg-python
