@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import httpx
 import os
 import uvicorn
@@ -56,13 +57,12 @@ async def slack_events(req: Request):
     payload = await req.json()
 
     if payload.get("type") == "url_verification":
-        return {"challenge": payload.get("challenge")}
+        return JSONResponse(content={"challenge": payload.get("challenge")})
 
     event = payload.get("event", {})
     if "bot_id" in event:
         return {"ok": True}
 
-    # Trata abertura da App Home para permitir DMs
     if event.get("type") == "app_home_opened" and event.get("user"):
         user_id = event["user"]
         async with httpx.AsyncClient() as client:
