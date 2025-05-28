@@ -120,10 +120,15 @@ async def slack_events(req: Request):
             }
         )
 
-        result = slidespeak_resp.json()
-        print(f"🎯 Resposta SlideSpeak: {result}")
-
-        link = result.get("download_url", "Não foi possível gerar a apresentação.")
+        try:
+            result = slidespeak_resp.json()
+            print(f"🎯 Resposta SlideSpeak: {result}")
+            if isinstance(result, str):
+                raise ValueError("Resposta inválida da API SlideSpeak")
+            link = result.get("download_url", "Não foi possível gerar a apresentação.")
+        except Exception as e:
+            print(f"❌ Erro ao processar resposta SlideSpeak: {e}")
+            link = "Erro ao gerar apresentação. Verifique a chave da API."
 
         await client.post(
             "https://slack.com/api/chat.postMessage",
