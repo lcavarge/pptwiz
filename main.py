@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 import httpx
 import os
 import uvicorn
@@ -9,6 +9,7 @@ import mimetypes
 import tempfile
 import subprocess
 from typing import Optional
+import asyncio
 
 from PyPDF2 import PdfReader
 from docx import Document
@@ -52,18 +53,42 @@ async def extract_text_from_file(file_path: str) -> str:
                 return await f.read()
     return ""
 
+async def gerar_apresentacao(conteudo):
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": SLIDESPEAK_API_KEY
+    }
+    payload = {
+        "plain_text": conteudo,
+        "length": 5,
+        "template": "default",
+        "language": "ORIGINAL",
+        "fetch_images": True,
+        "tone": "default",
+        "verbosity": "standard"
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post("https://api.slidespeak.co/api/v1/presentation/generate", headers=headers, json=payload)
+        response.raise_for_status()
+        task_id = response.json().get("task_id")
+
+        while True:
+            status_response = await client.get(f"https://api.slidespeak.co/api/v1/task_status/{task_id}", headers={"X-API-Key": SLIDESPEAK_API_KEY})
+            status_response.raise_for_status()
+            status_data = status_response.json()
+            if status_data["task_status"] == "SUCCESS":
+                return status_data["task_result"]["url"]
+            elif status_data["task_status"] == "FAILED":
+                return "Não foi possível gerar a apresentação."
+            await asyncio.sleep(5)
+
 @app.post("/slack/events")
 async def slack_events(req: Request):
     payload = await req.json()
-    print("🔔 Slack chamou o endpoint")
-    print(payload)
 
     if payload.get("type") == "url_verification":
-        return Response(
-            content=f'{{"challenge":"{payload.get("challenge")}"}}',
-            media_type="application/json",
-            status_code=200
-        )
+        return JSONResponse(content={"challenge": payload.get("challenge")})
 
     event = payload.get("event", {})
     if "bot_id" in event:
@@ -103,39 +128,17 @@ async def slack_events(req: Request):
         file_info = files[0]
         file_url = file_info.get("url_private_download")
         downloaded_file = await download_file_from_slack(file_url)
-        print(f"📎 Arquivo baixado: {downloaded_file}")
         if downloaded_file:
             extracted_content = await extract_text_from_file(downloaded_file)
-            print(f"📄 Conteúdo extraído: {extracted_content[:200]}...")
+
+    link = await gerar_apresentacao(extracted_content)
 
     async with httpx.AsyncClient() as client:
-        slidespeak_resp = await client.post(
-            "https://api.slidespeak.co/v1/ppt/generate",
-            headers={"Authorization": f"Bearer {SLIDESPEAK_API_KEY}"},
-            json={
-                "title": "Apresentação gerada via Slack Bot",
-                "content": extracted_content,
-                "slides": 5,
-                "template": "default"
-            }
-        )
-
-        try:
-            result = slidespeak_resp.json()
-            print(f"🎯 Resposta SlideSpeak: {result}")
-            if isinstance(result, str):
-                raise ValueError("Resposta inválida da API SlideSpeak")
-            link = result.get("download_url", "Não foi possível gerar a apresentação.")
-        except Exception as e:
-            print(f"❌ Erro ao processar resposta SlideSpeak: {e}")
-            link = "Erro ao gerar apresentação. Verifique a chave da API."
-
         await client.post(
             "https://slack.com/api/chat.postMessage",
             headers=HEADERS_SLACK,
             json={"channel": channel_id, "text": f"Aqui está sua apresentação: {link}"}
         )
-        print("✅ Mensagem enviada para o Slack")
 
     return {"ok": True}
 
