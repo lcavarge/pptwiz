@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import httpx
 import os
 import uvicorn
@@ -59,7 +59,11 @@ async def slack_events(req: Request):
     print(payload)
 
     if payload.get("type") == "url_verification":
-        return JSONResponse(content={"challenge": payload.get("challenge")})
+        return Response(
+            content=f'{{"challenge":"{payload.get("challenge")}"}}',
+            media_type="application/json",
+            status_code=200
+        )
 
     event = payload.get("event", {})
     if "bot_id" in event:
