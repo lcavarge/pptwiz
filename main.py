@@ -55,6 +55,8 @@ async def extract_text_from_file(file_path: str) -> str:
 @app.post("/slack/events")
 async def slack_events(req: Request):
     payload = await req.json()
+    print("🔔 Slack chamou o endpoint")
+    print(payload)
 
     if payload.get("type") == "url_verification":
         return JSONResponse(content={"challenge": payload.get("challenge")})
@@ -97,8 +99,10 @@ async def slack_events(req: Request):
         file_info = files[0]
         file_url = file_info.get("url_private_download")
         downloaded_file = await download_file_from_slack(file_url)
+        print(f"📎 Arquivo baixado: {downloaded_file}")
         if downloaded_file:
             extracted_content = await extract_text_from_file(downloaded_file)
+            print(f"📄 Conteúdo extraído: {extracted_content[:200]}...")
 
     async with httpx.AsyncClient() as client:
         slidespeak_resp = await client.post(
@@ -113,6 +117,8 @@ async def slack_events(req: Request):
         )
 
         result = slidespeak_resp.json()
+        print(f"🎯 Resposta SlideSpeak: {result}")
+
         link = result.get("download_url", "Não foi possível gerar a apresentação.")
 
         await client.post(
@@ -120,6 +126,7 @@ async def slack_events(req: Request):
             headers=HEADERS_SLACK,
             json={"channel": channel_id, "text": f"Aqui está sua apresentação: {link}"}
         )
+        print("✅ Mensagem enviada para o Slack")
 
     return {"ok": True}
 
