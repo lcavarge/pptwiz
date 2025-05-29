@@ -76,6 +76,10 @@ async def gerar_apresentacao(texto:str, slides:int=5)->str:
 # ───────────────────────── Slack events ───────────────────────────
 @app.post("/slack/events")
 async def slack_events(req: Request):
+    payload = await req.json()
+    # LOG entrada completa do Slack
+    print("🔔 Slack chamou o endpoint:", payload)
+(req: Request):
     payload=await req.json()
 
     if payload.get("type")=="url_verification":
@@ -104,11 +108,14 @@ async def slack_events(req: Request):
     link=await gerar_apresentacao(text)
 
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        await c.post("https://slack.com/api/chat.postMessage", headers=HEADERS_SLACK,
-                     json={"channel":channel,"text":f"Aqui está sua apresentação: {link}"})
+        slack_resp = await c.post(
+            "https://slack.com/api/chat.postMessage",
+            headers=HEADERS_SLACK,
+            json={"channel": channel, "text": f"Aqui está sua apresentação: {link}"}
+        )
+        print("💬 Slack postMessage status:", slack_resp.json())
     return {"ok":True}
 
 # ────────────────────────── main ──────────────────────────────────
 if __name__=="__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT",10000)))
-
