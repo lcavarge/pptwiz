@@ -3,8 +3,11 @@ uvicorn
 httpx
 python-dotenv
 aiofiles
+pandas
+openpyxl
 PyPDF2
 python-docx
+openai
 
 # Áudio (opcional)
 git+https://github.com/openai/whisper.git
