@@ -1,152 +1,167 @@
+```python
+import os
+import logging
+import asyncio
+import tempfile
+import mimetypes
+
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
-import os, uvicorn, httpx, asyncio, datetime, traceback, pandas as pd
-import aiofiles, mimetypes, tempfile, subprocess
+from fastapi.responses import JSONResponse
+import httpx
+from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from docx import Document
-import openai
-from typing import Optional
+import aiofiles
 
-# ───── logger ─────────────────────────────────────────────
-def log(step: str, d: Optional[dict] = None):
-    ts = datetime.datetime.utcnow().isoformat(timespec="seconds")
-    extra = " ".join(f"{k}={v}" for k, v in (d or {}).items())
-    print(f"[{ts}] {step}" + (f" | {extra}" if extra else ""))
+# Load environment variables
+tmp = tempfile.gettempdir()
+load_dotenv()
 
-# ───── env vars ──────────────────────────────────────────
-SLACK_TOKEN   = os.getenv("SLACK_BOT_TOKEN")
-SS_API_KEY    = os.getenv("SLIDESPEAK_API_KEY")
-OPENAI_KEY    = os.getenv("OPENAI_API_KEY")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLIDESPEAK_API_KEY = os.getenv("SLIDESPEAK_API_KEY")
 
-HEAD_SLACK = {"Authorization": f"Bearer {SLACK_TOKEN}"}
-HEAD_SS    = {"Content-Type": "application/json",
-              "X-API-Key": SS_API_KEY}
-openai.api_key = OPENAI_KEY
-TIMEOUT = httpx.Timeout(60.0, connect=30.0)
+# Prepare Slack headers
+HEADERS_SLACK = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
+logger = logging.getLogger("pptwiz")
+
+# Initialize FastAPI
 app = FastAPI()
 
-@app.api_route("/", methods=["GET", "HEAD"])
-async def root(): return Response(status_code=200)
+async def download_file(url: str) -> str:
+    """
+    Download a file from Slack to a temporary local file.
+    Returns the local file path.
+    """
+    async with httpx.AsyncClient() as client:
+        logger.info("Slack|download file| url=%s", url)
+        resp = await client.get(url, headers=HEADERS_SLACK)
+        resp.raise_for_status()
+        ext = mimetypes.guess_extension(resp.headers.get("Content-Type", "")) or ".bin"
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        tmp_file.write(resp.content)
+        tmp_file.close()
+        return tmp_file.name
 
-# ───── file helpers ──────────────────────────────────────
-async def download_slack(url:str)->Optional[str]:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
-        r=await c.get(url,headers=HEAD_SLACK)
-        if r.status_code==200:
-            ext=mimetypes.guess_extension(r.headers.get("Content-Type","")) or ".tmp"
-            tmp=tempfile.NamedTemporaryFile(delete=False,suffix=ext)
-            tmp.write(r.content); tmp.close(); return tmp.name
-    return None
-
-async def extract(path:str)->str:
-    if path.endswith(".xlsx"):
-        df=pd.read_excel(path, sheet_name=0)
-        return df.head(20).to_markdown(index=False)
-    if path.endswith(".pdf"):
-        return "\n".join(p.extract_text() or "" for p in PdfReader(path).pages)[:4000]
-    if path.endswith(".docx"):
-        return "\n".join(p.text for p in Document(path).paragraphs)[:4000]
-    if path.endswith(".txt"):
-        async with aiofiles.open(path,"r",encoding="utf-8") as f:
-            return (await f.read())[:4000]
+async def extract_text(file_path: str) -> str:
+    """
+    Extract text from common file types: PDF, DOCX, TXT.
+    """
+    logger.info("Extracting text from file: %s", file_path)
+    lower = file_path.lower()
+    if lower.endswith(".pdf"):
+        reader = PdfReader(file_path)
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
+    if lower.endswith(".docx"):
+        doc = Document(file_path)
+        return "\n".join(para.text for para in doc.paragraphs)
+    if lower.endswith(".txt"):
+        async with aiofiles.open(file_path, mode="r", encoding="utf-8") as f:
+            return await f.read()
     return ""
 
-# ───── GPT & SlideSpeak ─────────────────────────────────
-async def gerar_roteiro(texto:str,pedido:str)->str:
-    system="Você é analista. Gere JSON com title e slides[].heading/bullets."
-    user=f"Pedido:\n{pedido}\n\nDados:\n{texto}"
-    resp = await openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"system","content":system},
-                  {"role":"user","content":user}],
-        response_format={"type":"json_object"})
-    return resp.choices[0].message.content
+async def generate_presentation(content: str, slides: int = 5) -> str:
+    """
+    Send content to SlideSpeak API to generate a PPT, poll for completion,
+    and return the presentation URL.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": SLIDESPEAK_API_KEY
+    }
+    payload = {
+        "plain_text": content,
+        "length": slides,
+        "template": "default",
+        "language": "ORIGINAL",
+        "fetch_images": True,
+        "tone": "default",
+        "verbosity": "standard"
+    }
 
-async def slide_url(json_content:str)->str:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
-        r=await c.post("https://api.slidespeak.co/api/v1/presentation/generate",
-                       headers=HEAD_SS,
-                       json={"json_content":json_content})
-        task=r.json()["task_id"]
+    async with httpx.AsyncClient() as client:
+        logger.info("SlideSpeak|generating| chars=%d slides=%d", len(content), slides)
+        response = await client.post(
+            "https://api.slidespeak.co/api/v1/presentation/generate",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        response.raise_for_status()
+        task_id = response.json().get("task_id")
+        logger.info("SlideSpeak|task created| id=%s", task_id)
+
+        # Poll for status
         while True:
-            s=await c.get(f"https://api.slidespeak.co/api/v1/task_status/{task}",
-                          headers={"X-API-Key":SS_API_KEY})
-            d=s.json()
-            if d["task_status"]=="SUCCESS": return d["task_result"]["url"]
-            if d["task_status"]=="FAILED":  return "Erro ao gerar PPT."
-            await asyncio.sleep(4)
+            status_resp = await client.get(
+                f"https://api.slidespeak.co/api/v1/task_status/{task_id}",
+                headers=headers,
+                timeout=60
+            )
+            status_resp.raise_for_status()
+            data = status_resp.json()
+            status = data.get("task_status")
+            if status == "SUCCESS":
+                url = data.get("task_result", {}).get("url", "")
+                logger.info("SlideSpeak|success| url=%s", url)
+                return url
+            if status == "FAILED":
+                logger.error("SlideSpeak|failed")
+                return ""
+            await asyncio.sleep(5)
 
-# ───── sessions + dedup ─────────────────────────────────
-sessions, asked_flag, dedup = {}, {}, {}
-def sess_key(ev):
-    if ev.get("channel_type")=="im": return ev["user"]
-    return ev.get("thread_ts") or ev.get("ts") or ev.get("event_ts")
-
-def is_duplicate(cid:str)->bool:
-    now=datetime.datetime.utcnow().timestamp()
-    for k,t in list(dedup.items()):
-        if now-t>300: dedup.pop(k,None)
-    if cid in dedup: return True
-    dedup[cid]=now; return False
-
-# ───── Slack events ─────────────────────────────────────
 @app.post("/slack/events")
-async def slack_events(req: Request):
-    p=await req.json()
-    if p.get("type")=="url_verification":
-        return Response(content=f'{{"challenge":"{p["challenge"]}"}}',
-                        media_type="application/json")
+async def slack_events(request: Request):
+    payload = await request.json()
+    logger.info("Slack|payload received| type=%s", payload.get("type"))
 
-    ev=p.get("event",{})
-    if "bot_id" in ev: return {"ok":True}
+    # URL verification for Slack Events API
+    if payload.get("type") == "url_verification":
+        return JSONResponse({"challenge": payload.get("challenge")})
 
-    cid = ev.get("client_msg_id") or ev.get("ts") or ev.get("event_ts")
-    if cid and is_duplicate(cid):
-        log("dup",{"id":cid}); return {"ok":True}
+    event = payload.get("event", {})
 
-    key=sess_key(ev)
-    sess=sessions.setdefault(key,{"pedido":"","texto":""})
+    # Ignore messages from bots
+    if event.get("bot_id"):
+        return {"ok": True}
 
-    if txt:=ev.get("text"): sess["pedido"]+=" "+txt
-    if ev.get("files"):
-        ftmp=await download_slack(ev["files"][0]["url_private_download"])
-        if ftmp: sess["texto"]+="\n"+await extract(ftmp)
+    # Extract text or file content
+    text = event.get("text", "")
+    files = event.get("files", [])
+    if files:
+        try:
+            file_url = files[0].get("url_private_download")
+            path = await download_file(file_url)
+            text = await extract_text(path)
+        except Exception as e:
+            logger.error("Error extracting file: %s", e)
 
-    channel = ev["user"] if ev.get("channel_type")=="im" else ev["channel"]
-    msg_low = ev.get("text","").lower().strip()
+    # Generate the presentation
+    url = await generate_presentation(text)
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as c:
-        if msg_low not in {"gera","pronto"} and not asked_flag.get(key):
-            await c.post("https://slack.com/api/chat.postMessage",
-                         headers=HEAD_SLACK,
-                         json={"channel":channel,
-                               "thread_ts": ev.get("thread_ts") or ev.get("ts") or ev.get("event_ts"),
-                               "text":"✅ Recebi! Envie mais detalhes ou arquivos e digite *gera* quando terminar."})
-            asked_flag[key]=True
-            return {"ok":True}
+    # Send response back to Slack
+    channel = event.get("channel")
+    if url:
+        message = f"Aqui está sua apresentação: {url}"
+    else:
+        message = "Ocorreu um erro ao gerar a apresentação."
 
-        if msg_low in {"gera","pronto"}:
-            await c.post("https://slack.com/api/chat.postMessage",
-                         headers=HEAD_SLACK,
-                         json={"channel":channel,
-                               "thread_ts": key if ev.get("channel_type")!="im" else None,
-                               "text":"⏳ Gerando apresentação, aguarde…"})
-            try:
-                roteiro_json=await gerar_roteiro(sess["texto"],sess["pedido"])
-                url=await slide_url(roteiro_json)
-            except Exception as e:
-                traceback.print_exc(); url="Erro ao gerar PPT."
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://slack.com/api/chat.postMessage",
+            headers=HEADERS_SLACK,
+            json={"channel": channel, "text": message}
+        )
+        ok = resp.json().get("ok")
+        logger.info("Slack|message sent| ok=%s channel=%s", ok, channel)
 
-            await c.post("https://slack.com/api/chat.postMessage",
-                         headers=HEAD_SLACK,
-                         json={"channel":channel,
-                               "thread_ts": key if ev.get("channel_type")!="im" else None,
-                               "text":f"Aqui está sua apresentação: {url}"})
-            sessions.pop(key,None); asked_flag.pop(key,None)
-    return {"ok":True}
+    return {"ok": True}
 
-# ───── main ─────────────────────────────────────────────
-if __name__=="__main__":
-    uvicorn.run("main:app",host="0.0.0.0",
-                port=int(os.getenv("PORT",10000)))
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 10000))
+    logger.info("Starting server on port %d", port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
+```
